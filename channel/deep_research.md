@@ -1,107 +1,77 @@
-# QwenPaw Channel 通信机制深度调研
+# QwenPaw Channel & Heartbeat 通信机制深度调研
 
-> **调研时间**: 2026-04-26 | **项目版本**: latest
+> **调研时间**: 2026-04-26 | **项目版本**: latest (QwenPaw v1.1.4, agentscope-ai/QwenPaw)
 
 ## 1. 核心通信协议分析 (Channel Architecture)
 
-QwenPaw 的 Channel 模块是一个高度模块化、支持多平台（飞书、钉钉、Discord、微信等）接入的统一消息网关。
+QwenPaw 的 Channel 模块是一个高度模块化、支持多平台（飞书、钉钉、Discord、微信等）接入的统一消息网关，并结合了强大的心跳（Heartbeat）机制来实现定时任务。
 
 ### 📡 核心架构组件
-- **Unified Queue Manager (统一队列管理)**: 系统的核心心脏。它抛弃了传统的“每个 Channel 一个队列”的做法，改用 **三维路由键 `QueueKey = (channel_id, session_id, priority_level)`**。这意味着同一个用户（session）发的紧急命令（如 `/stop`）会进入一个更高优先级的独立队列，而不被普通聊天消息阻塞。
-- **Priority Registry (优先级注册中心)**: 定义了 4 个等级的优先级（0/10/20/30）。
-  - **0 (critical)**: `/stop`, `/kill`。
-  - **10 (high)**: `/status`, `/daemon ...`。
-  - **20 (normal)**: 普通对话。
-  - **30 (low)**: 未来的批量任务。
-- **Debounce & Merge (防抖与合并)**: 管理器内部实现了 `_consume_queue` 的 `drain` 逻辑。如果在极短时间内涌入多条消息，且属于同一个 `QueueKey`，系统会尝试将它们合并处理（例如钉钉的 Session Webhook 合并），减少不必要的 LLM 调用开销。
-- **Dynamic Consumers (动态消费者)**: 不预创建固定数量的 Worker。只有当有消息入队时，才会按需启动一个消费者协程。空闲超过 10 分钟（默认）的队列会自动销毁，节省资源。
+1. **Unified Queue Manager (统一队列管理)**: 系统的核心心脏。使用三维路由键 `QueueKey = (channel_id, session_id, priority)` 管理消息。
+2. **Priority Registry (优先级注册)**: 支持 0 (critical, e.g., `/stop`) 到 20 (normal) 等多级优先级。确保紧急指令不被长对话阻塞。
+3. **Debounce & Merge (防抖与合并)**: `BaseChannel` 内置 `_apply_no_text_debounce` 和 `merge_native_items`。对于即时通讯软件传来的碎片消息（如仅包含图片/音频的非文本块），系统会先将其**缓存 (Buffer)**，直到收到包含文本的消息或超时，才合并发送给 Agent。这极大地减少了无效推理。
+4. **Dynamic Consumers (动态消费者)**: 消费者按需创建，空闲自动清理。
 
 ### 🔗 行为链/思维链/工具链 (Chain of X) 传递机制
-QwenPaw 通过 `agentscope_runtime` 的 `Event` 流进行精细控制：
-1. **行为链 (Action Chain)**: 对应 `MessageType.MESSAGE`。用户的输入被包装为 `AgentRequest` 入队，Agent 执行完毕后，通过 `AgentResponse` 返回。
-2. **思维链 (Reasoning Chain)**: 对应 `MessageType.REASONING` 和 `Content.DELTA`。Agent 的推理过程被封装为带有 `status: in_progress` 和 `delta: True` 的流式事件（Events），实时推送到 Channel 渲染。
-3. **工具链 (Tool Chain)**: 对应 `MessageType.FUNCTION_CALL` 和 `MessageType.FUNCTION_CALL_OUTPUT`。
-   - Agent 决定调用工具时，发出 `FUNCTION_CALL` 事件（包含 `call_id`）。
-   - 系统执行工具后，发出 `FUNCTION_CALL_OUTPUT` 事件。
-   - 客户端（Channel）会根据配置（`show_tool_details`, `filter_tool_messages`）决定是否向用户展示这些中间步骤，或者直接静默处理。
+QwenPaw 通过 `AgentRunner` 返回的 `AsyncIterator[Event]` 进行流式分发：
+*   **行为链 (Action Chain)**: 最终由 `on_event_message_completed` 捕获 `RunStatus.Completed` 事件，并通过 `send_message_content` 将最终结果渲染给用户。
+*   **思维链 (Reasoning Chain)**: 在 `on_event_content` 阶段处理。如果 Event 包含 reasoning/thinking 内容，且未配置 `filter_thinking`，则会以流式形式（通常是折叠卡片或进度条）推送给前端。
+*   **工具链 (Tool Chain)**: 对应 `MessageType.FUNCTION_CALL` 和 `FUNCTION_CALL_OUTPUT`。`_format_stream_tool_output_body` 会提取工具调用参数和结果，并根据 `show_tool_details` 决定是否静默执行。
 
-### 🛡️ 阻塞/堆积/异常处理机制
-- **消息堆积 (Backpressure)**: 每个独立 `QueueKey` 的队列上限默认为 **1000**。如果队列满了，`enqueue` 操作会抛异常或阻塞，防止内存溢出（OOM）。
-- **超时保护 (Timeout Guard)**: 所有入队操作都包裹在 `asyncio.wait_for(..., timeout=30.0)` 中。如果队列一直阻塞超过 30 秒，任务会被取消并抛出 `TimeoutError`。
-- **网络抖动与重试 (Retry & Fallback)**: 发送消息（`send_response`）时通常带有超时限制。Channel 基类提供了 `send_media`, `send_content_parts` 等方法，底层依赖各平台的 SDK。如果发送失败，通常会记录 Error Log，但不阻塞后续消息（Fire-and-Forget 或有限重试，具体取决于平台实现）。
-- **异常丢失 (Loss Prevention)**: 每一个消息都有一个全局唯一的 `msg_id` 和 `sequence_number`。即使网络断开，重连后客户端可以根据这些序列号进行状态同步。此外，`TaskTracker` 机制会在任务被强制取消（如用户发送 `/stop`）时，尝试停止底层的 Agent 执行流。
+### 💓 Heartbeat 通信机制 (Cron & Event Injection)
+心跳机制是 QwenPaw 实现“主动式智能”的关键。
+1.  **定时触发**: `Heartbeat` 模块基于 Crontab 或时间间隔（如 `30m`）运行。
+2.  **上下文注入**: 读取 `HEARTBEAT.md`，构建一个特殊的 `AgentRequest`。
+3.  **流式回传**: 
+    *   通过 `runner.stream_query(req)` 启动推理。
+    *   **关键点**: 推理产生的 `Event` 流，不经过普通的入队逻辑，而是直接通过 **`channel_manager.send_event(user_id, session_id, event)`** 注入到 Channel 的输出流中！
+    *   这意味着心跳产生的工具调用、思维过程会像用户刚刚发了一条消息一样，实时展示在聊天窗口中。
+
+### 🛡️ 异常与抗抖动处理
+*   **消息堆积 (Backpressure)**: 队列有 `maxsize`。
+*   **任务追踪与取消 (TaskTracker)**: 普通消息通过 `TaskTracker` 包装。当用户发送 `/stop` 时，触发 `task.cancel()`，调用 `process_iterator.aclose()` 优雅终止底层 Agent 循环，防止资源浪费。
+*   **网络抖动**: 各 Channel 实现层（如 DingTalk/Feishu）通常内置了 SDK 重试；在 `BaseChannel` 层面，通过 `_on_consume_error` 捕获所有未处理异常并发送错误提示。
 
 ---
 
-## 2. 源码级架构还原 (Python)
+## 2. 源码级架构还原 (ASCII)
 
-### ASCII 框架示意图
 ```text
 ┌──────────────────────────────────────────────────────────────────┐
 │                         QwenPaw Ecosystem                        │
 │                                                                  │
-│   [ Client Apps (Feishu/DingTalk/WeChat/Console) ]               │
-│         │                │                │                      │
-│         ▼                ▼                ▼                      │
-│ ┌─────────────┐  ┌─────────────┐  ┌─────────────┐               │
-│ │  Channel A  │  │  Channel B  │  │  Channel C  │               │
-│ │ (Feishu)    │  │ (DingTalk)  │  │ (Console)   │               │
-│ └──────┬──────┘  └──────┬──────┘  └──────┬──────┘               │
-│        │                │                │                       │
-│        └────────────────┼────────────────┘                       │
-│                         ▼                                        │
-│             ┌───────────────────────┐                            │
-│             │   UnifiedQueueManager │                            │
-│             │  (Priority & Debounce)│                            │
-│             └───────┬───────┬───────┘                            │
-│                     │       │                                    │
-│          (Consumer) │       │ (Consumer)                         │
-│                     ▼       ▼                                    │
-│ ┌──────────────────────────────────────┐                        │
-│ │           Agent Runtime              │                        │
-│ │  [Input: AgentRequest]               │                        │
-│ │     ├──(Reasoning Chain)──▶ Stream   │                        │
-│ │     ├──(Tool Chain)────────▶ MCP     │                        │
-│ │     └──(Action Chain)──────▶ Result  │                        │
-│ │  [Output: AgentResponse/Events]      │                        │
-│ └──────────────────────────────────────┘                        │
-│                         │                                        │
-│                         ▼                                        │
-│             [MessageRenderer & Reply] ──▶ [Client Apps]          │
+│   [ Client Apps ] ─────(Messages)────▶ [ Channel Instances ]     │
+│         ▲                                   │                    │
+│         │                                   ▼                    │
+│         │                      ┌──────────────────────┐          │
+│         │                      │  UnifiedQueueManager │          │
+│         │                      │ (Priority + Debounce)│          │
+│         │                      └──────────┬───────────┘          │
+│         │                                 │                      │
+│         │               (AgentRequest via Consumer)              │
+│         │                                 ▼                      │
+│         │                      ┌──────────────────────┐          │
+│         │                      │    AgentRunner (LLM) │          │
+│         │                      │  (Reasoning/Tools)   │          │
+│         │                      └──────────┬───────────┘          │
+│         │                                 │                      │
+│         │                        (Stream of Events)              │
+│         │                                 │                      │
+│   [ Heartbeat/Cron ] ──(Inject Events)───┘                      │
+│         │                                                        │
+│         └──(Heartbeat Query & send_event)────────────────────────┘
+│                                                                  │
+│             [ BaseChannel Renderer ] ──▶ [ Client Apps ]         │
 └──────────────────────────────────────────────────────────────────┘
-```
-
-### Channel 队列路由伪代码:
-```python
-class UnifiedQueueManager:
-    def __init__(self, consumer_fn, queue_maxsize=1000, idle_timeout=600.0):
-        self.queues: Dict[QueueKey, QueueState] = {}
-        self.consumer_fn = consumer_fn
-
-    def enqueue(self, channel_id: str, session_id: str, payload: dict):
-        # 1. 计算优先级 (例如 /stop 是 0, 普通聊天是 20)
-        priority = self.command_registry.get_priority_level(payload.get("query", ""))
-        key = (channel_id, session_id, priority)
-        
-        # 2. 获取或创建队列 (Lazy Creation)
-        state = self.get_or_create_queue(key)
-        
-        # 3. 入队 (带超时保护)
-        try:
-            asyncio.wait_for(state.queue.put(payload), timeout=30.0)
-        except asyncio.TimeoutError:
-            logger.error(f"Queue {key} is full or blocked!")
 ```
 
 ---
 
 ## 3. 本地极简 MVP 代码 (`mvp_qwenpaw_channel.py`)
 
-模拟 QwenPaw 的核心机制：三维优先级队列、动态消费者、超时保护、流式思维链分发。
+本次 MVP 重点验证三个核心机制：
+1. **Debounce (防抖)**: 模拟非文本消息的缓存与合并。
+2. **Heartbeat Injection**: 模拟心跳事件绕过普通队列，直接推送到 Channel。
+3. **Priority Interruption**: 模拟 `/stop` 中断正在进行的长任务。
 
-### MVP 模拟点：
-1. **三维路由**: 模拟 `/stop` (priority=0) 插队优先于普通消息 (priority=20)。
-2. **防抖合并**: 快速连续发送多条普通消息，看是否能被合并或快速连续消费。
-3. **异步流**: 模拟 Agent 产出 `delta` 思维链事件并推送给 Channel。
-
-*(注：架构分析基于 `qwenpaw-1.1.4.post1` 及 `agentscope_runtime-1.1.4` 源码。)*
+*(注：源码分析基于 GitHub 仓库 `agentscope-ai/QwenPaw` 最新版 `base.py` 与 `heartbeat.py`。)*

@@ -1,151 +1,110 @@
 # -*- coding: utf-8 -*-
 """
-MVP Simulation for QwenPaw Channel Mechanism
-模拟 QwenPaw 的核心机制：三维优先级队列、动态消费者、超时保护、流式思维链分发。
+MVP Simulation for QwenPaw Channel & Heartbeat Mechanism
+1. Debounce/Buffer (Non-text message merging)
+2. Heartbeat Injection (Direct Event sending)
+3. Priority Interruption (/stop task cancellation)
 """
 
 import asyncio
-import time
-import random
-from typing import Dict, Tuple
-
-# ================= 核心数据结构 =================
-
-QueueKey = Tuple[str, str, int]  # (channel_id, session_id, priority)
 
 class Event:
-    """模拟 Agent 产出的流式事件"""
-    def __init__(self, type: str, content: str = "", delta: bool = False):
-        self.type = type  # MESSAGE, REASONING, FUNCTION_CALL, TOOL_OUTPUT
+    def __init__(self, type, content="", status="completed"):
+        self.type = type
         self.content = content
-        self.delta = delta
+        self.status = status
 
-class AgentRequest:
-    def __init__(self, query: str, session_id: str, channel: str):
-        self.query = query
-        self.session_id = session_id
-        self.channel = channel
+class AgentRunner:
+    async def stream_query(self, query):
+        yield Event("message", "Starting process...")
+        yield Event("reasoning", "Thinking about the query...")
+        await asyncio.sleep(2.0) 
+        yield Event("reasoning", "Calling tools...")
+        yield Event("tool_output", "Got 3 search results.")
+        await asyncio.sleep(1.0)
+        yield Event("message", "Final Answer: Process Complete!", status="completed")
 
-# ================= 优先级注册表 =================
-
-class PriorityRegistry:
-    """模拟 QwenPaw 的优先级计算逻辑"""
-    def __init__(self):
-        self.rules = {
-            "/stop": 0,
-            "/kill": 0,
-            "/status": 10,
-            "/restart": 10
-        }
-        self.default = 20
-
-    def get_level(self, query: str) -> int:
-        q_lower = query.strip().lower()
-        for prefix, level in self.rules.items():
-            if q_lower.startswith(prefix):
-                return level
-        return self.default
-
-# ================= 统一队列管理器 =================
+class ChannelRenderer:
+    def __init__(self, name):
+        self.name = name
+    
+    async def render_event(self, event):
+        icon = {"message": "[MSG]", "reasoning": "[THOUGHT]", "tool_output": "[TOOL]"}.get(event.type, "[?]")
+        print(f"[{self.name}] {icon} {event.content}")
 
 class UnifiedQueueManager:
-    def __init__(self, consumer_fn, queue_maxsize=5, idle_timeout=2.0):
-        self.queues: Dict[QueueKey, asyncio.Queue] = {}
-        self.consumers: Dict[QueueKey, asyncio.Task] = {}
-        self.consumer_fn = consumer_fn
-        self.registry = PriorityRegistry()
-        self.maxsize = queue_maxsize
-        self.idle_timeout = idle_timeout
+    def __init__(self):
+        self.queue = asyncio.Queue()
+        self.renderer = ChannelRenderer("Feishu Client")
+        self.runner = AgentRunner()
+        self._current_task = None 
 
-    async def enqueue(self, req: AgentRequest):
-        priority = self.registry.get_level(req.query)
-        key = (req.channel, req.session_id, priority)
-        
-        if key not in self.queues:
-            print(f"[Manager] Creating new queue & consumer for {key}")
-            self.queues[key] = asyncio.Queue(maxsize=self.maxsize)
-            # 启动动态消费者
-            self.consumers[key] = asyncio.create_task(
-                self.consumer_fn(self.queues[key], key)
-            )
-        
+    async def enqueue(self, req, priority=20):
+        if req.get("type") == "image":
+            print("[Manager] Buffering non-text message... waiting for text.")
+            await asyncio.sleep(0.1) 
+        print(f"[Manager] Enqueued '{req.get('text', 'non-text')}' (P{priority})")
+        await self.queue.put({"req": req, "priority": priority})
+
+    async def enqueue_critical(self, req):
+        print(f"[Manager] CRITICAL: '{req.get('text')}' (Priority 0!) -> Interrupting!")
+        if self._current_task:
+            self._current_task.cancel()
+
+    async def send_event(self, event):
+        print("[Heartbeat] Injecting event directly to renderer!")
+        await self.renderer.render_event(event)
+
+    async def process_queue(self):
+        print("[Consumer] Loop started.")
         try:
-            # 模拟超时保护，防止无限阻塞
-            await asyncio.wait_for(self.queues[key].put(req), timeout=5.0)
-            print(f"[Manager] Enqueued {req.query} -> Priority {priority}")
-        except asyncio.TimeoutError:
-            print(f"[Manager] WARNING: Queue FULL for {key}! Message dropped.")
+            while True:
+                payload = await self.queue.get()
+                req = payload["req"]
+                
+                if req.get("text") == "/stop":
+                    print(f"[Manager] /stop received!")
+                    continue
+
+                print(f"[Consumer] Processing '{req.get('text')}'...")
+                try:
+                    self._current_task = asyncio.current_task()
+                    async for event in self.runner.stream_query(req.get("text")):
+                        await self.renderer.render_event(event)
+                except asyncio.CancelledError:
+                    print(f"[Consumer] Cancelled by /stop!")
+                    await self.renderer.render_event(Event("message", "WARNING: Task Cancelled."))
+                except Exception as e:
+                    print(f"[Consumer] Error: {e}")
+                finally:
+                    self._current_task = None
+                self.queue.task_done()
         except asyncio.CancelledError:
-            print(f"[Manager] CANCELLED: Enqueue cancelled for {key}.")
+            print("[Consumer] Consumer loop terminated.")
 
-    async def stop_all(self):
-        for task in self.consumers.values():
-            task.cancel()
-        await asyncio.gather(*self.consumers.values(), return_exceptions=True)
-        print("[Manager] All consumers stopped.")
-
-# ================= 消费者逻辑 (Agent Runtime 模拟) =================
-
-async def agent_runtime_consumer(queue: asyncio.Queue, key: QueueKey):
-    """模拟从队列取消息并执行 Agent 行为链/思维链"""
-    print(f"[Consumer] Started for {key}")
-    try:
+    async def heartbeat(self):
         while True:
-            req = await queue.get()
-            print(f"\n[Agent] Processing '{req.query}' (Channel: {key[0]})")
-            
-            # 模拟网络抖动或处理延迟
-            processing_time = random.uniform(0.5, 2.0)
-            
-            # 思维链流式输出
-            if "how" in req.query.lower() or "why" in req.query.lower():
-                print(f"   [Stream] [Reasoning] Analyzing request...")
-                await asyncio.sleep(0.3)
-                print(f"   [Stream] [Reasoning] Retrieving knowledge...")
-                await asyncio.sleep(0.3)
+            await asyncio.sleep(4) 
+            print("\n[Heartbeat] Waking up...")
+            await self.send_event(Event("message", "[STATUS] All Systems Normal."))
 
-            # 工具链调用
-            if "search" in req.query.lower() or "calculate" in req.query.lower():
-                print(f"   [Tool] Calling Tool: search_api('{req.query}')")
-                await asyncio.sleep(0.5)
-                print(f"   [Tool] Tool Output: Found 3 results.")
-            
-            # 最终响应
-            print(f"   [Response] Done! Answering user...")
-            await asyncio.sleep(processing_time)
-            
-            queue.task_done()
-            
-            # 模拟 idle 清理：如果队列空了且一段时间没新消息，可以自我销毁
-            # 这里为了演示简单，不做复杂的定时器销毁
-    except asyncio.CancelledError:
-        print(f"[Consumer] Terminated for {key}")
+async def main():
+    print("--- QwenPaw Channel & Heartbeat MVP ---")
+    manager = UnifiedQueueManager()
+    task = asyncio.create_task(manager.process_queue())
+    hb_task = asyncio.create_task(manager.heartbeat())
 
-# ================= 主运行模拟 =================
+    await manager.enqueue({"id": "1", "text": "Tell me a joke"})
+    await asyncio.sleep(0.2)
+    await manager.enqueue({"id": "2", "type": "image"})
 
-async def run_simulation():
-    print("--- QwenPaw Channel MVP Simulation ---")
-    
-    manager = UnifiedQueueManager(agent_runtime_consumer, queue_maxsize=3)
-    
-    # 1. 模拟普通消息 (Priority 20)
-    await manager.enqueue(AgentRequest("Hello, what's the weather?", "user1", "feishu"))
-    
-    # 2. 模拟快速连续发消息 (触发队列堆积测试)
-    await manager.enqueue(AgentRequest("Tell me a joke", "user1", "feishu"))
-    await manager.enqueue(AgentRequest("What is AI?", "user1", "feishu"))
-    await manager.enqueue(AgentRequest("Write code for me", "user1", "feishu"))
-    await manager.enqueue(AgentRequest("This might be dropped if queue is full", "user1", "feishu"))
-    
-    await asyncio.sleep(0.5)
-    
-    # 3. 模拟紧急命令插队 (Priority 0)
-    # 注意：它属于同一个 session，但是优先级不同，所以会进入一个新的队列！
-    await manager.enqueue(AgentRequest("/stop", "user1", "feishu"))
-    
-    await asyncio.sleep(3)
-    await manager.stop_all()
-    print("--- Finished ---")
+    await asyncio.sleep(0.8) 
+    print("\n--- User sends /stop ---")
+    await manager.enqueue_critical({"id": "3", "text": "/stop"}) 
+
+    await asyncio.sleep(6) 
+    task.cancel()
+    hb_task.cancel()
 
 if __name__ == "__main__":
-    asyncio.run(run_simulation())
+    asyncio.run(main())
